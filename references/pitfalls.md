@@ -37,3 +37,50 @@
 - 看图贵：同一张图只读一次，要对比就自己拼一张对比图
 - 稳定版 exe 不覆盖；新版本放独立目录，日志/站点/cookie 全部跟目录走
 - 大改之前先确认「当前跑的是哪个 exe」：比对 exe 与源码的修改时间，别对着旧包排查
+
+## 误判「未开播」：页面里的 roomId 占位符
+
+**现象**：直播间明明在播，程序一直停在「等待开播…」，日志里连表头 CSV 都是空的。
+
+**根因**：`liveMan.py` 的 `is_room_live()` 兜底用 `roomId.*:(\d+)` 抓房间号，
+但直播页前面先出现占位符 `roomId\":0`，于是拿到 0 → `0 > 0` 为假 → 判定未开播。
+主判断 `roomInfo...status...user_count_str` 又要求这两个字段紧挨着，
+遇到「status 在 room 对象里、user_count_str 在别处」的页面同样匹配不到。
+
+**正确做法**：
+
+1. 只认 SSR 数据里 `roomStore.roomInfo.room` 这一个对象，用大括号配对截取
+   （页面里的 JSON 可能是 `\"` 双转义形态，也要支持）；
+2. 该对象里 `status`：**2 / 0 = 直播中，4 = 已结束**；
+3. 兜底只认带引号的 `roomId":"<数字>"`，裸 `roomId":0` 是占位符；
+4. 都判断不出就返回 `None`，让调用方按「可能开播」去连，而不是卡在等待。
+
+```python
+def _extract_room_block(text: str) -> str:
+    keys = (
+        '\\"roomStore\\":{\\"roomInfo\\":{\\"room\\":{',
+        '"roomStore":{"roomInfo":{"room":{',
+    )
+    for key in keys:
+        i = text.find(key)
+        if i < 0:
+            continue
+        start, depth, j = i + len(key) - 1, 0, i + len(key) - 1
+        escaped = key.startswith('\\')
+        while j < len(text):
+            ch = text[j]
+            if escaped and ch == '\\':
+                j += 2
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:j + 1]
+            j += 1
+    return ''
+```
+
+`status == 2` 的房间是真正在播；`status == 4` 才是下播。
+别用 `room_status` 字段名去猜——网页端根本没有这个字段。
